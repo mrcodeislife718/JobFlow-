@@ -1,0 +1,10 @@
+import { JobFlowCore } from './jobflow.js';
+const app = new JobFlowCore();
+const lead = app.captureLead({ name: 'Demo Customer', email: 'demo@example.invalid', source: 'missed-call', service: 'consultation', missedCall: true });
+app.qualifyLead(lead.id, { qualified: true });
+const customer = app.createCustomerFromLead(lead.id);
+const appointment = app.scheduleAppointment({ customerId: customer.id, service: 'consultation', startsAt: '2026-08-17T14:00:00Z', priceCents: 12500, recovered: true });
+app.transitionAppointment(appointment.id, 'confirmed');
+app.transitionAppointment(appointment.id, 'completed');
+app.recordPayment({ appointmentId: appointment.id, amountCents: 12500 });
+console.log(JSON.stringify(app.revenueSummary(), null, 2));
