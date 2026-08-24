@@ -86,15 +86,17 @@ function suppliedApiKey(req) {
 
 function createRateLimiter({ windowMs = 60_000, max = 120 } = {}) {
   const buckets = new Map();
-  return function consume(key, now = Date.now()) {
-    const current = buckets.get(key);
-    if (!current || current.resetAt <= now) {
-      buckets.set(key, { count: 1, resetAt: now + windowMs });
-      return { allowed: true, remaining: max - 1, resetAt: now + windowMs };
-    }
-    current.count += 1;
-    if (current.count > max) return { allowed: false, remaining: 0, resetAt: current.resetAt };
-    return { allowed: true, remaining: max - current.count, resetAt: current.resetAt };
+  return {
+    consume(key, now = Date.now()) {
+      const current = buckets.get(key);
+      if (!current || current.resetAt <= now) {
+        buckets.set(key, { count: 1, resetAt: now + windowMs });
+        return { allowed: true, remaining: max - 1, resetAt: now + windowMs };
+      }
+      current.count += 1;
+      if (current.count > max) return { allowed: false, remaining: 0, resetAt: current.resetAt };
+      return { allowed: true, remaining: max - current.count, resetAt: current.resetAt };
+    },
   };
 }
 
