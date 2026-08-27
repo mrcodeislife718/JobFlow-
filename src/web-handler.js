@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JobFlowAppService } from './app-service.js';
+import { billingConfigured, createBillingPortal, createCheckoutSession, subscriptionUpdateFromStripe, verifyStripeWebhook } from './commercial.js';
 
 const publicRoot = fileURLToPath(new URL('../public/', import.meta.url));
 const contentTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
@@ -22,29 +23,32 @@ function applySecurityHeaders(res, id) {
 }
 
 function json(res, status, value) {
-  const body = JSON.stringify(value);
+  const payload = JSON.stringify(value);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
+    'content-length': Buffer.byteLength(payload),
     'cache-control': 'no-store',
   });
-  res.end(body);
+  res.end(payload);
 }
 
-async function body(req) {
+async function rawBody(req, maxBytes = 2_000_000) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1_000_000) throw Object.assign(new Error('request body too large'), { statusCode: 413 });
+    if (size > maxBytes) throw Object.assign(new Error('request body too large'), { statusCode: 413 });
     chunks.push(chunk);
   }
-  if (!chunks.length) return {};
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function body(req) {
+  const raw = await rawBody(req, 1_000_000);
+  if (!raw) return {};
   try {
-    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('JSON body must be an object');
-    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('JSON body must be an object');
     return parsed;
   } catch (error) {
     if (error?.statusCode) throw error;
@@ -109,6 +113,7 @@ export async function createJobFlowHandler({
   service = new JobFlowAppService(),
   apiKey = process.env.JOBFLOW_API_KEY ?? '',
   requireAuth = process.env.NODE_ENV === 'production',
+  requireSubscription = process.env.JOBFLOW_REQUIRE_SUBSCRIPTION ? process.env.JOBFLOW_REQUIRE_SUBSCRIPTION !== 'false' : process.env.NODE_ENV === 'production',
   rateLimitWindowMs = Number(process.env.JOBFLOW_RATE_LIMIT_WINDOW_MS ?? 60_000),
   rateLimitMax = Number(process.env.JOBFLOW_RATE_LIMIT_MAX ?? 120),
 } = {}) {
@@ -127,10 +132,17 @@ export async function createJobFlowHandler({
 
     try {
       if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/health/live')) {
-        return json(res, 200, { ok: true, service: 'jobflow', status: 'live', requestId: id });
+        return json(res, 200, { ok: true, service: 'jobflow', status: 'live', billingConfigured: billingConfigured(), requestId: id });
       }
       if (req.method === 'GET' && url.pathname === '/health/ready') {
         return json(res, ready ? 200 : 503, { ok: ready, service: 'jobflow', status: ready ? 'ready' : 'not_ready', requestId: id });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/webhooks/stripe') {
+        const raw = await rawBody(req);
+        const event = verifyStripeWebhook(raw, req.headers['stripe-signature']);
+        const result = await service.applyBillingEvent(event.id, subscriptionUpdateFromStripe(event));
+        return json(res, 200, { received: true, duplicate: result.duplicate });
       }
 
       if (url.pathname.startsWith('/api/')) {
@@ -144,6 +156,25 @@ export async function createJobFlowHandler({
           res.setHeader('www-authenticate', 'Bearer realm="JobFlow"');
           return json(res, 401, { error: 'unauthorized', requestId: id });
         }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/billing/status') return json(res, 200, { configured: billingConfigured(), subscription: service.billingState() });
+      if (req.method === 'POST' && url.pathname === '/api/billing/checkout') {
+        if (!billingConfigured()) return json(res, 503, { error: 'billing_not_configured', requestId: id });
+        const input = await body(req);
+        const session = await createCheckoutSession({ businessId: service.business.id, customerEmail: input.email });
+        return json(res, 201, { id: session.id, url: session.url });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/billing/portal') {
+        if (!service.billingState().customerId) return json(res, 409, { error: 'stripe_customer_not_linked', requestId: id });
+        const portal = await createBillingPortal(service.billingState().customerId);
+        return json(res, 201, { url: portal.url });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/economic-production') return json(res, 200, service.economicProduction());
+
+      const paidExempt = new Set(['/api/billing/status','/api/billing/checkout','/api/billing/portal','/api/economic-production']);
+      if (requireSubscription && url.pathname.startsWith('/api/') && !paidExempt.has(url.pathname) && !service.isPaid()) {
+        return json(res, 402, { error: 'active_subscription_required', checkout: '/api/billing/checkout', requestId: id });
       }
 
       if (req.method === 'GET' && url.pathname === '/api/dashboard') return json(res, 200, service.dashboard());
