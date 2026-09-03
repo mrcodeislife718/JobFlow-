@@ -70,7 +70,10 @@ export function subscriptionUpdateFromStripe(event) {
       businessId: object.metadata?.business_id ?? object.client_reference_id,
       customerId: object.customer ?? null,
       subscriptionId: object.subscription ?? null,
-      status: 'active',
+      // Checkout links commercial identifiers only. The Stripe subscription object
+      // is authoritative for entitlement state and must arrive before paid access.
+      status: 'pending',
+      entitlementAuthoritative: false,
     };
   }
   if (String(event.type ?? '').startsWith('customer.subscription.')) {
@@ -79,6 +82,7 @@ export function subscriptionUpdateFromStripe(event) {
       customerId: object.customer ?? null,
       subscriptionId: object.id ?? null,
       status: ['active','trialing'].includes(object.status) ? 'active' : object.status === 'past_due' ? 'past_due' : 'inactive',
+      entitlementAuthoritative: true,
     };
   }
   return null;
