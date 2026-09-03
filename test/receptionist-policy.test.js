@@ -17,3 +17,18 @@ test('requires approval for consequential scheduling changes and verifies extern
   });
   assert.equal(event.verification.verified, true);
 });
+
+test('records a failed external transition and only accepts verified recovery', () => {
+  const workflow = new AppointmentWorkflow({ bookingId: 'b2', customerId: 'c2' });
+  assert.throws(() => workflow.perform('send_confirmation', {
+    execute: () => ({ delivered: false }),
+    verify: result => ({ verified: result.delivered })
+  }), /verification failed/);
+  const recovery = workflow.recover({
+    strategy: 'retry-secondary-provider',
+    execute: () => ({ delivered: true, provider: 'secondary' }),
+    verify: result => ({ verified: result.delivered === true })
+  });
+  assert.equal(recovery.verification.verified, true);
+  assert.equal(workflow.receipt().failures[0].recoveryStrategy, 'retry-secondary-provider');
+});
