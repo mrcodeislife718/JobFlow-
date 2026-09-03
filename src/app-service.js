@@ -52,18 +52,44 @@ export class JobFlowAppService {
     return normalized;
   }
 
+  #restoreEconomic(events) {
+    this.economicEvents = structuredClone(events);
+    this.economic = new JobFlowEconomicProductionLedger();
+    for (const event of this.economicEvents) this.economic.record(event);
+  }
+
   async applyBillingEvent(eventId, update) {
-    if (!eventId || this.processedBillingEvents.has(eventId)) return { duplicate: true, subscription: this.subscription };
+    if (typeof eventId !== 'string' || !eventId.trim()) throw new Error('billing event id is required');
+    if (!update) return { duplicate: false, ignored: true, subscription: this.subscription };
+    if (typeof update.businessId !== 'string' || !update.businessId.trim()) throw new Error('billing event business identity is required');
+    if (update.businessId !== this.business.id) throw new Error('billing event business mismatch');
+    if (this.processedBillingEvents.has(eventId)) return { duplicate: true, ignored: false, subscription: this.subscription };
+
+    const previousSubscription = structuredClone(this.subscription);
+    const previousEconomicEvents = structuredClone(this.economicEvents);
     this.processedBillingEvents.add(eventId);
-    if (update?.businessId && update.businessId !== this.business.id) throw new Error('billing event business mismatch');
-    if (update) {
+    try {
       const wasActive = this.subscription.status === 'active';
-      this.subscription = { ...this.subscription, ...update, updatedAt: new Date().toISOString() };
-      if (!wasActive && this.subscription.status === 'active') this.recordEconomic({ type: 'paying_business' });
-      if (wasActive && this.subscription.status === 'active') this.recordEconomic({ type: 'retained_business' });
+      const { entitlementAuthoritative = true, businessId: _businessId, ...billingFields } = update;
+      if (entitlementAuthoritative) {
+        this.subscription = { ...this.subscription, ...billingFields, updatedAt: new Date().toISOString() };
+      } else {
+        // Checkout completion may link Stripe identifiers but cannot grant, revoke,
+        // or downgrade entitlement. customer.subscription.* is authoritative.
+        const { status: _status, ...identityFields } = billingFields;
+        this.subscription = { ...this.subscription, ...identityFields, updatedAt: new Date().toISOString() };
+      }
+      if (entitlementAuthoritative && !wasActive && this.subscription.status === 'active') {
+        this.recordEconomic({ type: 'paying_business' });
+      }
+      await this.persist();
+      return { duplicate: false, ignored: false, subscription: this.subscription };
+    } catch (error) {
+      this.subscription = previousSubscription;
+      this.processedBillingEvents.delete(eventId);
+      this.#restoreEconomic(previousEconomicEvents);
+      throw error;
     }
-    await this.persist();
-    return { duplicate: false, subscription: this.subscription };
   }
 
   isPaid() { return this.subscription.status === 'active'; }
